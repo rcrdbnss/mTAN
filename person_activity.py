@@ -1,8 +1,6 @@
 import os
 
 import utils
-import numpy as np
-import tarfile
 import torch
 from torch.utils.data import DataLoader
 from torchvision.datasets.utils import download_url

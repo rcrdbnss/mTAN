@@ -6,6 +6,25 @@ import torch.nn.functional as F
 import numpy as np
 
 
+class Regressor(nn.Module):
+
+    def __init__(self, latent_dim, nhidden=16, output_dim=1):
+        super().__init__()
+        self.gru_rnn = nn.GRU(latent_dim, nhidden, batch_first=True)
+        self.regressor = nn.Sequential(
+            nn.Linear(nhidden, 300),
+            nn.ReLU(),
+            nn.Linear(300, 300),
+            nn.ReLU(),
+            nn.Linear(300, output_dim))
+
+    def forward(self, z):
+        _, out = self.gru_rnn(z)
+        out = self.regressor(out.squeeze(0))
+        out = out.squeeze()
+        return out
+
+
 class create_classifier(nn.Module):
  
     def __init__(self, latent_dim, nhidden=16, N=2):

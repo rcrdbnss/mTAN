@@ -1,4 +1,6 @@
 # pylint: disable=E1101
+from sklearn.preprocessing import StandardScaler
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -7,7 +9,9 @@ import numpy as np
 from physionet import PhysioNet, get_data_min_max, variable_time_collate_fn2
 from sklearn import model_selection
 from sklearn import metrics
-from person_activity import PersonActivity
+# from person_activity import PersonActivity
+
+device = None
 
 
 def count_parameters(model):
@@ -41,7 +45,7 @@ def normalize_masked_data(data, mask, att_min, att_max):
     att_max[att_max == 0.] = 1.
 
     if (att_max != 0.).all():
-        data_norm = (data - att_min) / att_max
+        data_norm = (data - att_min) / (att_max - att_min)  # old: ... / att_max
     else:
         raise Exception("Zero!")
 
@@ -54,7 +58,7 @@ def normalize_masked_data(data, mask, att_min, att_max):
     return data_norm, att_min, att_max
 
 
-def evaluate(dim, rec, dec, test_loader, args, num_sample=10, device="cuda"):
+def evaluate(dim, rec, dec, test_loader, args, num_sample=10, device_="cuda"):
     mse, test_n = 0.0, 0.0
     with torch.no_grad():
         for test_batch in test_loader:
@@ -92,7 +96,7 @@ def evaluate(dim, rec, dec, test_loader, args, num_sample=10, device="cuda"):
     return mse / test_n
 
 
-def compute_losses(dim, dec_train_batch, qz0_mean, qz0_logvar, pred_x, args, device):
+def compute_losses(dim, dec_train_batch, qz0_mean, qz0_logvar, pred_x, args, device_):
     observed_data, observed_mask \
         = dec_train_batch[:, :, :dim], dec_train_batch[:, :, dim:2*dim]
 
@@ -110,30 +114,116 @@ def compute_losses(dim, dec_train_batch, qz0_mean, qz0_logvar, pred_x, args, dev
     return logpx, analytic_kl
 
 
-def evaluate_classifier(model, test_loader, dec=None, args=None, classifier=None,
-                        dim=41, device='cuda', reconst=False, num_sample=1):
+def evaluate_regressor_(model, test_loader, dec=None, args=None, regressor=None,
+                       dim=41, reconst=False, num_sample=1):
     pred = []
     true = []
     test_loss = 0
     for test_batch, label in test_loader:
         test_batch, label = test_batch.to(device), label.to(device)
         batch_len = test_batch.shape[0]
-        observed_data, observed_mask, observed_tp \
-            = test_batch[:, :, :dim], test_batch[:, :, dim:2*dim], test_batch[:, :, -1]
+        observed_data, observed_mask, observed_tp = test_batch[:, :, :dim], test_batch[:, :, dim:2*dim], test_batch[:, :, -1]
         with torch.no_grad():
-            out = model(
-                torch.cat((observed_data, observed_mask), 2), observed_tp)
+            out = model(torch.cat((observed_data, observed_mask), 2), observed_tp)
             if reconst:
-                qz0_mean, qz0_logvar = out[:, :,
-                                           :args.latent_dim], out[:, :, args.latent_dim:]
-                epsilon = torch.randn(
-                    num_sample, qz0_mean.shape[0], qz0_mean.shape[1], qz0_mean.shape[2]).to(device)
+                qz0_mean, qz0_logvar = out[:, :, :args.latent_dim], out[:, :, args.latent_dim:]
+                epsilon = torch.randn(num_sample, qz0_mean.shape[0], qz0_mean.shape[1], qz0_mean.shape[2]).to(device)
                 z0 = epsilon * torch.exp(.5 * qz0_logvar) + qz0_mean
                 z0 = z0.view(-1, qz0_mean.shape[1], qz0_mean.shape[2])
                 if args.classify_pertp:
-                    pred_x = dec(z0, observed_tp[None, :, :].repeat(
-                        num_sample, 1, 1).view(-1, observed_tp.shape[1]))
-                    #pred_x = pred_x.view(num_sample, batch_len, pred_x.shape[1], pred_x.shape[2])
+                    pred_x = dec(z0, observed_tp[None, :, :].repeat(num_sample, 1, 1).view(-1, observed_tp.shape[1]))
+                    out = regressor(pred_x)
+                else:
+                    out = regressor(z0)
+            if args.classify_pertp:
+                out = out.view(-1)
+                label = label.view(-1)
+                # _, label = label.max(-1)  # todo: ask, regression shouldn't need this line
+                test_loss += nn.MSELoss()(out, label).item() * batch_len * 50.
+            else:
+                label = label.unsqueeze(0).repeat_interleave(num_sample, 0).squeeze(0)
+                test_loss += nn.MSELoss()(out, label).item() * batch_len * num_sample
+
+        pred.append(out.cpu().numpy())
+        true.append(label.cpu().numpy())
+    pred = np.concatenate(pred, 0)
+    true = np.concatenate(true, 0)
+    acc = np.mean(np.abs(pred - true))
+    mse = metrics.mean_squared_error(true, pred)
+    mae = metrics.mean_absolute_error(true, pred)
+    r2 = metrics.r2_score(true, pred)
+
+    return test_loss / pred.shape[0], acc, mse, mae, r2
+
+
+def predict_regr(model, test_loader, dec=None, args=None, regressor=None, dim=41, reconst=False, num_sample=1):
+    pred = []
+    true = []
+    for test_batch, label in test_loader:
+        test_batch, label = test_batch.to(device), label.to(device)
+        observed_data, observed_mask, observed_tp = test_batch[:, :, :dim], test_batch[:, :, dim:2*dim], test_batch[:, :, -1]
+        with torch.no_grad():
+            out = model(torch.cat((observed_data, observed_mask), 2), observed_tp)
+            if reconst:
+                qz0_mean, qz0_logvar = out[:, :, :args.latent_dim], out[:, :, args.latent_dim:]
+                epsilon = torch.randn(num_sample, qz0_mean.shape[0], qz0_mean.shape[1], qz0_mean.shape[2]).to(device)
+                z0 = epsilon * torch.exp(.5 * qz0_logvar) + qz0_mean
+                z0 = z0.view(-1, qz0_mean.shape[1], qz0_mean.shape[2])
+                if args.classify_pertp:
+                    pred_x = dec(z0, observed_tp[None, :, :].repeat(num_sample, 1, 1).view(-1, observed_tp.shape[1]))
+                    out = regressor(pred_x)
+                else:
+                    out = regressor(z0)
+            if args.classify_pertp:
+                out = out.view(-1)
+                label = label.view(-1)
+            else:
+                label = label.unsqueeze(0).repeat_interleave(num_sample, 0).view(-1)
+        pred.append(out.cpu().numpy())
+        true.append(label.cpu().numpy())
+    pred = np.concatenate(pred, 0)
+    true = np.concatenate(true, 0)
+    return pred, true
+
+
+def evaluate_regressor(model, test_loader, dec=None, args=None, regressor=None, dim=41, reconst=False, num_sample=1,
+                        data_min=None, data_max=None):
+    pred, true = predict_regr(model, test_loader, dec, args, regressor, dim, reconst, num_sample)
+    pred, true = np.reshape(pred, -1), np.reshape(true, -1)
+
+    if data_min is not None and data_max is not None:
+        max_val = data_max[0].cpu().numpy()
+        min_val = data_min[0].cpu().numpy()
+        pred = (pred * (max_val - min_val)) + min_val
+        true = (true * (max_val - min_val)) + min_val
+
+    test_loss = metrics.mean_squared_error(true, pred)# * num_sample
+    acc = np.mean(np.abs(pred - true))
+    mse = metrics.mean_squared_error(true, pred)
+    mae = metrics.mean_absolute_error(true, pred)
+    r2 = metrics.r2_score(true, pred)
+
+    return test_loss, acc, mse, mae, r2
+
+
+def evaluate_classifier(model, test_loader, dec=None, args=None, classifier=None,
+                        dim=41, device_='cuda', reconst=False, num_sample=1):
+    pred = []
+    true = []
+    test_loss = 0
+    for test_batch, label in test_loader:
+        test_batch, label = test_batch.to(device), label.to(device)
+        batch_len = test_batch.shape[0]
+        observed_data, observed_mask, observed_tp = test_batch[:, :, :dim], test_batch[:, :, dim:2*dim], test_batch[:, :, -1]
+        with torch.no_grad():
+            out = model(torch.cat((observed_data, observed_mask), 2), observed_tp)
+            if reconst:
+                qz0_mean, qz0_logvar = out[:, :, :args.latent_dim], out[:, :, args.latent_dim:]
+                epsilon = torch.randn(num_sample, qz0_mean.shape[0], qz0_mean.shape[1], qz0_mean.shape[2]).to(device)
+                z0 = epsilon * torch.exp(.5 * qz0_logvar) + qz0_mean
+                z0 = z0.view(-1, qz0_mean.shape[1], qz0_mean.shape[2])
+                if args.classify_pertp:
+                    pred_x = dec(z0, observed_tp[None, :, :].repeat(num_sample, 1, 1).view(-1, observed_tp.shape[1]))
                     out = classifier(pred_x)
                 else:
                     out = classifier(z0)
@@ -144,9 +234,9 @@ def evaluate_classifier(model, test_loader, dec=None, args=None, classifier=None
                 _, label = label.max(-1)
                 test_loss += nn.CrossEntropyLoss()(out, label.long()).item() * batch_len * 50.
             else:
-                label = label.unsqueeze(0).repeat_interleave(
-                    num_sample, 0).view(-1)
+                label = label.unsqueeze(0).repeat_interleave(num_sample, 0).view(-1)
                 test_loss += nn.CrossEntropyLoss()(out, label).item() * batch_len * num_sample
+
         pred.append(out.cpu().numpy())
         true.append(label.cpu().numpy())
     pred = np.concatenate(pred, 0)
@@ -154,19 +244,100 @@ def evaluate_classifier(model, test_loader, dec=None, args=None, classifier=None
     acc = np.mean(pred.argmax(1) == true)
     auc = metrics.roc_auc_score(
         true, pred[:, 1]) if not args.classify_pertp else 0.
+
     return test_loss/pred.shape[0], acc, auc
 
 
-def get_mimiciii_data(args):
+def get_mimiciii_data(args, task):
+    def y_from_numpy(y):
+        if task == 'clf':
+            return torch.from_numpy(y).long()
+        elif task == 'reg':
+            return torch.from_numpy(y).float()
+        return None  # crash it all
+
+    assert task in ['clf', 'reg']
     input_dim = 12
-    x = np.load('../../../neuraltimeseries/Dataset/final_input3.npy')
-    y = np.load('../../../neuraltimeseries/Dataset/final_output3.npy')
+    x = np.load('datasets/mimic/X.npy')
+    y = np.load(f'datasets/mimic/y_{task}.npy')
     x = x[:, :25]
     x = np.transpose(x, (0, 2, 1))
 
     # normalize values and time
-    observed_vals, observed_mask, observed_tp = x[:, :,
-                                                  :input_dim], x[:, :, input_dim:2*input_dim], x[:, :, -1]
+    observed_vals, observed_mask, observed_tp = x[:, :, :input_dim], x[:, :, input_dim:2*input_dim], x[:, :, -1]
+    if np.max(observed_tp) != 0.:
+        observed_tp = observed_tp / np.max(observed_tp)
+
+    y_min, y_max = None, None
+    if not args.nonormalize:
+        for k in range(input_dim):
+            data_min, data_max = float('inf'), 0.
+            for i in range(observed_vals.shape[0]):
+                for j in range(observed_vals.shape[1]):
+                    if observed_mask[i, j, k]:
+                        data_min = min(data_min, observed_vals[i, j, k])
+                        data_max = max(data_max, observed_vals[i, j, k])
+            # scaling boundaries on the whole dataset, not only training set
+            if data_max == 0:
+                data_max = 1
+            observed_vals[:, :, k] = (observed_vals[:, :, k] - data_min) / (data_max - data_min)
+        if task == 'reg':
+            y_min, y_max = np.min(y), np.max(y)
+            if y_max == 0:
+                y_max = 1
+            y = (y - y_min) / (y_max - y_min)
+    # set masked out elements back to zero
+    observed_vals[observed_mask == 0] = 0
+    # print(observed_vals[0], observed_tp[0])
+    print(x.shape, y.shape)
+    if task == 'clf':
+        kfold = model_selection.StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
+    elif task == 'reg':
+        kfold = model_selection.KFold(n_splits=5, shuffle=True, random_state=0)
+    splits = [(train_inds, test_inds) for train_inds, test_inds in kfold.split(np.zeros(len(y)), y)]
+    x_train, y_train = x[splits[args.split][0]], y[splits[args.split][0]]
+    test_data_x, test_data_y = x[splits[args.split][1]], y[splits[args.split][1]]
+    if not args.old_split:
+        train_data_x, val_data_x, train_data_y, val_data_y = model_selection.train_test_split(
+                x_train, y_train, stratify=y_train, test_size=0.2, random_state=0)
+    else:
+        frac = int(0.8*x_train.shape[0])
+        train_data_x, val_data_x = x_train[:frac], x_train[frac:]
+        train_data_y, val_data_y = y_train[:frac], y_train[frac:]
+
+    print(train_data_x.shape, train_data_y.shape, val_data_x.shape, val_data_y.shape,
+          test_data_x.shape, test_data_y.shape)
+    print(np.sum(test_data_y))
+
+    train_data_combined = TensorDataset(torch.from_numpy(train_data_x).float(), y_from_numpy(train_data_y).squeeze())
+                                        # torch.from_numpy(train_data_y).long().squeeze())
+    val_data_combined = TensorDataset(torch.from_numpy(val_data_x).float(), y_from_numpy(val_data_y).squeeze())
+                                      # torch.from_numpy(val_data_y).long().squeeze())
+    test_data_combined = TensorDataset(torch.from_numpy(test_data_x).float(), y_from_numpy(test_data_y).squeeze())
+                                       # torch.from_numpy(test_data_y).long().squeeze())
+    train_dataloader = DataLoader(train_data_combined, batch_size=args.batch_size, shuffle=False)
+    test_dataloader = DataLoader(test_data_combined, batch_size=args.batch_size, shuffle=False)
+    val_dataloader = DataLoader(val_data_combined, batch_size=args.batch_size, shuffle=False)
+
+    data_objects = {"train_dataloader": train_dataloader,
+                    "test_dataloader": test_dataloader,
+                    "val_dataloader": val_dataloader,
+                    "input_dim": input_dim}
+    if task == 'reg':
+        data_objects['y_min'] = y_min
+        data_objects['y_max'] = y_max
+    return data_objects
+
+
+def get_mimiciii_data_clf(args):
+    input_dim = 12
+    x = np.load('datasets/mimic/X.npy')
+    y = np.load(f'datasets/mimic/y_clf.npy')
+    x = x[:, :25]
+    x = np.transpose(x, (0, 2, 1))
+
+    # normalize values and time
+    observed_vals, observed_mask, observed_tp = x[:, :, :input_dim], x[:, :, input_dim:2*input_dim], x[:, :, -1]
     if np.max(observed_tp) != 0.:
         observed_tp = observed_tp / np.max(observed_tp)
 
@@ -178,25 +349,19 @@ def get_mimiciii_data(args):
                     if observed_mask[i, j, k]:
                         data_min = min(data_min, observed_vals[i, j, k])
                         data_max = max(data_max, observed_vals[i, j, k])
-            #print(data_min, data_max)
+            # scaling boundaries on the whole dataset, not only training set
             if data_max == 0:
                 data_max = 1
-            observed_vals[:, :, k] = (
-                observed_vals[:, :, k] - data_min)/data_max
+            observed_vals[:, :, k] = (observed_vals[:, :, k] - data_min) / (data_max - data_min)
     # set masked out elements back to zero
     observed_vals[observed_mask == 0] = 0
-    print(observed_vals[0], observed_tp[0])
     print(x.shape, y.shape)
-    kfold = model_selection.StratifiedKFold(
-        n_splits=5, shuffle=True, random_state=0)
-    splits = [(train_inds, test_inds)
-              for train_inds, test_inds in kfold.split(np.zeros(len(y)), y)]
+    kfold = model_selection.StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
+    splits = [(train_inds, test_inds) for train_inds, test_inds in kfold.split(np.zeros(len(y)), y)]
     x_train, y_train = x[splits[args.split][0]], y[splits[args.split][0]]
-    test_data_x, test_data_y = x[splits[args.split]
-                                 [1]], y[splits[args.split][1]]
+    test_data_x, test_data_y = x[splits[args.split][1]], y[splits[args.split][1]]
     if not args.old_split:
-        train_data_x, val_data_x, train_data_y, val_data_y = \
-            model_selection.train_test_split(
+        train_data_x, val_data_x, train_data_y, val_data_y = model_selection.train_test_split(
                 x_train, y_train, stratify=y_train, test_size=0.2, random_state=0)
     else:
         frac = int(0.8*x_train.shape[0])
@@ -206,23 +371,87 @@ def get_mimiciii_data(args):
     print(train_data_x.shape, train_data_y.shape, val_data_x.shape, val_data_y.shape,
           test_data_x.shape, test_data_y.shape)
     print(np.sum(test_data_y))
-    train_data_combined = TensorDataset(torch.from_numpy(train_data_x).float(),
-                                        torch.from_numpy(train_data_y).long().squeeze())
-    val_data_combined = TensorDataset(torch.from_numpy(val_data_x).float(),
-                                      torch.from_numpy(val_data_y).long().squeeze())
-    test_data_combined = TensorDataset(torch.from_numpy(test_data_x).float(),
-                                       torch.from_numpy(test_data_y).long().squeeze())
-    train_dataloader = DataLoader(
-        train_data_combined, batch_size=args.batch_size, shuffle=False)
-    test_dataloader = DataLoader(
-        test_data_combined, batch_size=args.batch_size, shuffle=False)
-    val_dataloader = DataLoader(
-        val_data_combined, batch_size=args.batch_size, shuffle=False)
 
-    data_objects = {"train_dataloader": train_dataloader,
-                    "test_dataloader": test_dataloader,
-                    "val_dataloader": val_dataloader,
-                    "input_dim": input_dim}
+    train_data_combined = TensorDataset(torch.from_numpy(train_data_x).float(), torch.from_numpy(train_data_y).long().squeeze())
+    val_data_combined = TensorDataset(torch.from_numpy(val_data_x).float(), torch.from_numpy(val_data_y).long().squeeze())
+    test_data_combined = TensorDataset(torch.from_numpy(test_data_x).float(), torch.from_numpy(test_data_y).long().squeeze())
+    train_dataloader = DataLoader(train_data_combined, batch_size=args.batch_size, shuffle=False)
+    test_dataloader = DataLoader(test_data_combined, batch_size=args.batch_size, shuffle=False)
+    val_dataloader = DataLoader(val_data_combined, batch_size=args.batch_size, shuffle=False)
+
+    data_objects = {
+        "train_dataloader": train_dataloader,
+        "test_dataloader": test_dataloader,
+        "val_dataloader": val_dataloader,
+        "input_dim": input_dim
+    }
+    return data_objects
+
+
+def get_mimiciii_data_reg(args):
+    input_dim = 12
+    x = np.load('datasets/mimic/X.npy')
+    y = np.load(f'datasets/mimic/y_reg.npy')
+    x = x[:, :25]
+    x = np.transpose(x, (0, 2, 1))
+
+    # normalize values and time
+    observed_vals, observed_mask, observed_tp = x[:, :, :input_dim], x[:, :, input_dim:2*input_dim], x[:, :, -1]
+    if np.max(observed_tp) != 0.:
+        observed_tp = observed_tp / np.max(observed_tp)
+
+    y_min, y_max = None, None
+    if not args.nonormalize:
+        for k in range(input_dim):
+            data_min, data_max = float('inf'), 0.
+            for i in range(observed_vals.shape[0]):
+                for j in range(observed_vals.shape[1]):
+                    if observed_mask[i, j, k]:
+                        data_min = min(data_min, observed_vals[i, j, k])
+                        data_max = max(data_max, observed_vals[i, j, k])
+            # scaling boundaries on the whole dataset, not only training set
+            if data_max == 0:
+                data_max = 1
+            observed_vals[:, :, k] = (observed_vals[:, :, k] - data_min) / (data_max - data_min)
+        y_min, y_max = np.min(y), np.max(y)
+        if y_max == 0:
+            y_max = 1
+        y = (y - y_min) / (y_max - y_min)
+    # set masked out elements back to zero
+    observed_vals[observed_mask == 0] = 0
+    # print(observed_vals[0], observed_tp[0])
+    print(x.shape, y.shape)
+    kfold = model_selection.KFold(n_splits=5, shuffle=True, random_state=0)
+    splits = [(train_inds, test_inds) for train_inds, test_inds in kfold.split(np.zeros(len(y)), y)]
+    x_train, y_train = x[splits[args.split][0]], y[splits[args.split][0]]
+    test_data_x, test_data_y = x[splits[args.split][1]], y[splits[args.split][1]]
+    if not args.old_split:
+        train_data_x, val_data_x, train_data_y, val_data_y = model_selection.train_test_split(
+                x_train, y_train, stratify=y_train, test_size=0.2, random_state=0)
+    else:
+        frac = int(0.8*x_train.shape[0])
+        train_data_x, val_data_x = x_train[:frac], x_train[frac:]
+        train_data_y, val_data_y = y_train[:frac], y_train[frac:]
+
+    print(train_data_x.shape, train_data_y.shape, val_data_x.shape, val_data_y.shape,
+          test_data_x.shape, test_data_y.shape)
+    print(np.sum(test_data_y))
+
+    train_data_combined = TensorDataset(torch.from_numpy(train_data_x).float(), torch.from_numpy(train_data_y).float().squeeze())
+    val_data_combined = TensorDataset(torch.from_numpy(val_data_x).float(), torch.from_numpy(val_data_y).float().squeeze())
+    test_data_combined = TensorDataset(torch.from_numpy(test_data_x).float(), torch.from_numpy(test_data_y).float().squeeze())
+    train_dataloader = DataLoader(train_data_combined, batch_size=args.batch_size, shuffle=False)
+    test_dataloader = DataLoader(test_data_combined, batch_size=args.batch_size, shuffle=False)
+    val_dataloader = DataLoader(val_data_combined, batch_size=args.batch_size, shuffle=False)
+
+    data_objects = {
+        "train_dataloader": train_dataloader,
+        "test_dataloader": test_dataloader,
+        "val_dataloader": val_dataloader,
+        "input_dim": input_dim,
+        "y_min": y_min,
+        "y_max": y_max,
+    }
     return data_objects
 
 
@@ -352,8 +581,10 @@ def variable_time_collate_fn(batch, device=torch.device("cpu"), classify=False, 
         if classify:
             if activity:
                 combined_labels[b, :currlen] = labels.to(device)
+                assert False  # todo: check
             else:
-                combined_labels[b] = labels.to(device)
+                combined_labels[b] = labels.to(device)  # todo: check
+                # combined_labels[b] = (labels.to(device) - data_min[0]) / (data_max[0] - data_min[0])
 
     if not activity:
         enc_combined_vals, _, _ = normalize_masked_data(enc_combined_vals, enc_combined_mask,
@@ -371,62 +602,63 @@ def variable_time_collate_fn(batch, device=torch.device("cpu"), classify=False, 
 
 
 def get_activity_data(args, device):
-    n_samples = min(10000, args.n)
-    dataset_obj = PersonActivity('data/PersonActivity',
-                                 download=True, n_samples=n_samples, device=device)
-
-    print(dataset_obj)
-
-    train_data, test_data = model_selection.train_test_split(dataset_obj, train_size=0.8,
-                                                             random_state=42, shuffle=True)
-
-    # train_data = [train_data[i] for i in np.random.choice(len(train_data), len(train_data))]
-    # test_data = [test_data[i] for i in np.random.choice(len(test_data), len(test_data))]
-
-    record_id, tt, vals, mask, labels = train_data[0]
-    input_dim = vals.size(-1)
-
-    batch_size = min(min(len(dataset_obj), args.batch_size), args.n)
-    test_data_combined = variable_time_collate_fn(test_data, device, classify=args.classif,
-                                                  activity=True)
-    train_data, val_data = model_selection.train_test_split(train_data, train_size=0.8,
-                                                            random_state=11, shuffle=True)
-    train_data_combined = variable_time_collate_fn(
-        train_data, device, classify=args.classif, activity=True)
-    val_data_combined = variable_time_collate_fn(
-        val_data, device, classify=args.classif, activity=True)
-    print(train_data_combined[1].sum(
-    ), val_data_combined[1].sum(), test_data_combined[1].sum())
-    print(train_data_combined[0].size(), train_data_combined[1].size(),
-          val_data_combined[0].size(), val_data_combined[1].size(),
-          test_data_combined[0].size(), test_data_combined[1].size())
-
-    train_data_combined = TensorDataset(
-        train_data_combined[0], train_data_combined[1].long())
-    val_data_combined = TensorDataset(
-        val_data_combined[0], val_data_combined[1].long())
-    test_data_combined = TensorDataset(
-        test_data_combined[0], test_data_combined[1].long())
-
-    train_dataloader = DataLoader(
-        train_data_combined, batch_size=batch_size, shuffle=False)
-    test_dataloader = DataLoader(
-        test_data_combined, batch_size=batch_size, shuffle=False)
-    val_dataloader = DataLoader(
-        val_data_combined, batch_size=batch_size, shuffle=False)
-
-    #attr_names = train_dataset_obj.params
-    data_objects = {"train_dataloader": train_dataloader,
-                    "test_dataloader": test_dataloader,
-                    "val_dataloader": val_dataloader,
-                    "input_dim": input_dim,
-                    "n_train_batches": len(train_dataloader),
-                    "n_test_batches": len(test_dataloader),
-                    # "attr": attr_names, #optional
-                    "classif_per_tp": False,  # optional
-                    "n_labels": 1}  # optional
-
-    return data_objects
+    # n_samples = min(10000, args.n)
+    # dataset_obj = PersonActivity('data/PersonActivity',
+    #                              download=True, n_samples=n_samples, device=device)
+    #
+    # print(dataset_obj)
+    #
+    # train_data, test_data = model_selection.train_test_split(dataset_obj, train_size=0.8,
+    #                                                          random_state=42, shuffle=True)
+    #
+    # # train_data = [train_data[i] for i in np.random.choice(len(train_data), len(train_data))]
+    # # test_data = [test_data[i] for i in np.random.choice(len(test_data), len(test_data))]
+    #
+    # record_id, tt, vals, mask, labels = train_data[0]
+    # input_dim = vals.size(-1)
+    #
+    # batch_size = min(min(len(dataset_obj), args.batch_size), args.n)
+    # test_data_combined = variable_time_collate_fn(test_data, device, classify=args.classif,
+    #                                               activity=True)
+    # train_data, val_data = model_selection.train_test_split(train_data, train_size=0.8,
+    #                                                         random_state=11, shuffle=True)
+    # train_data_combined = variable_time_collate_fn(
+    #     train_data, device, classify=args.classif, activity=True)
+    # val_data_combined = variable_time_collate_fn(
+    #     val_data, device, classify=args.classif, activity=True)
+    # print(train_data_combined[1].sum(
+    # ), val_data_combined[1].sum(), test_data_combined[1].sum())
+    # print(train_data_combined[0].size(), train_data_combined[1].size(),
+    #       val_data_combined[0].size(), val_data_combined[1].size(),
+    #       test_data_combined[0].size(), test_data_combined[1].size())
+    #
+    # train_data_combined = TensorDataset(
+    #     train_data_combined[0], train_data_combined[1].long())
+    # val_data_combined = TensorDataset(
+    #     val_data_combined[0], val_data_combined[1].long())
+    # test_data_combined = TensorDataset(
+    #     test_data_combined[0], test_data_combined[1].long())
+    #
+    # train_dataloader = DataLoader(
+    #     train_data_combined, batch_size=batch_size, shuffle=False)
+    # test_dataloader = DataLoader(
+    #     test_data_combined, batch_size=batch_size, shuffle=False)
+    # val_dataloader = DataLoader(
+    #     val_data_combined, batch_size=batch_size, shuffle=False)
+    #
+    # #attr_names = train_dataset_obj.params
+    # data_objects = {"train_dataloader": train_dataloader,
+    #                 "test_dataloader": test_dataloader,
+    #                 "val_dataloader": val_dataloader,
+    #                 "input_dim": input_dim,
+    #                 "n_train_batches": len(train_dataloader),
+    #                 "n_test_batches": len(test_dataloader),
+    #                 # "attr": attr_names, #optional
+    #                 "classif_per_tp": False,  # optional
+    #                 "n_labels": 1}  # optional
+    #
+    # return data_objects
+    ...
 
 
 def irregularly_sampled_data_gen(n=10, length=20, seed=0):
@@ -580,7 +812,7 @@ def compute_pertp_loss(label_predictions, true_label, mask):
     label_predictions = label_predictions.reshape(n_traj * n_tp, n_dims)
     true_label = true_label.reshape(n_traj * n_tp, n_dims)
     mask = torch.sum(mask, -1) > 0
-    mask = mask.reshape(n_traj * n_tp,  1)
+    mask = mask.reshape(n_traj * n_tp, 1)
     _, true_label = true_label.max(-1)
     ce_loss = criterion(label_predictions, true_label.long())
     ce_loss = ce_loss * mask
@@ -588,93 +820,94 @@ def compute_pertp_loss(label_predictions, true_label, mask):
 
 
 def get_physionet_data_extrap(args, device, q, flag=1):
-    train_dataset_obj = PhysioNet('data/physionet', train=True,
-                                  quantization=q,
-                                  download=True, n_samples=min(10000, args.n),
-                                  device=device)
-    # Use custom collate_fn to combine samples with arbitrary time observations.
-    # Returns the dataset along with mask and time steps
-    test_dataset_obj = PhysioNet('data/physionet', train=False,
-                                 quantization=q,
-                                 download=True, n_samples=min(10000, args.n),
-                                 device=device)
-
-    # Combine and shuffle samples from physionet Train and physionet Test
-    total_dataset = train_dataset_obj[:len(train_dataset_obj)]
-
-    if not args.classif:
-        # Concatenate samples from original Train and Test sets
-        # Only 'training' physionet samples are have labels.
-        # Therefore, if we do classifiction task, we don't need physionet 'test' samples.
-        total_dataset = total_dataset + \
-            test_dataset_obj[:len(test_dataset_obj)]
-    print(len(total_dataset))
-    # Shuffle and split
-    train_data, test_data = model_selection.train_test_split(total_dataset, train_size=0.8,
-                                                             random_state=42, shuffle=True)
-
-    record_id, tt, vals, mask, labels = train_data[0]
-
-    # n_samples = len(total_dataset)
-    input_dim = vals.size(-1)
-    data_min, data_max = get_data_min_max(total_dataset, device)
-    batch_size = min(min(len(train_dataset_obj), args.batch_size), args.n)
-
-    def extrap(test_data):
-        enc_test_data = []
-        dec_test_data = []
-        for (record_id, tt, vals, mask, labels) in test_data:
-            midpt = 0
-            for tp in tt:
-                if tp < 24:
-                    midpt += 1
-                else:
-                    break
-            if mask[:midpt].sum() and mask[midpt:].sum():
-                enc_test_data.append(
-                    (record_id, tt[:midpt], vals[:midpt], mask[:midpt], labels))
-                dec_test_data.append(
-                    (record_id, tt[midpt:], vals[midpt:], mask[midpt:], labels))
-        return enc_test_data, dec_test_data
-
-    enc_train_data, dec_train_data = extrap(train_data)
-    enc_test_data, dec_test_data = extrap(test_data)
-    enc_train_data_combined = variable_time_collate_fn(
-        enc_train_data, device, classify=args.classif, data_min=data_min, data_max=data_max)
-    dec_train_data_combined = variable_time_collate_fn(
-        dec_train_data, device, classify=args.classif, data_min=data_min, data_max=data_max)
-    enc_test_data_combined = variable_time_collate_fn(
-        enc_test_data, device, classify=args.classif, data_min=data_min, data_max=data_max)
-    dec_test_data_combined = variable_time_collate_fn(
-        dec_test_data, device, classify=args.classif, data_min=data_min, data_max=data_max)
-    print(enc_train_data_combined.shape, dec_train_data_combined.shape)
-    print(enc_test_data_combined.shape, dec_test_data_combined.shape)
-
-    # keep the timepoints in enc between 0.0 and 0.5
-    enc_train_data_combined[:, :, -1] *= 0.5
-    enc_test_data_combined[:, :, -1] *= 0.5
-    print(enc_train_data_combined[0, :, -1], dec_train_data_combined[0, :, -1])
-    enc_train_dataloader = DataLoader(
-        enc_train_data_combined, batch_size=batch_size, shuffle=False)
-    dec_train_dataloader = DataLoader(
-        dec_train_data_combined, batch_size=batch_size, shuffle=False)
-    enc_test_dataloader = DataLoader(
-        enc_test_data_combined, batch_size=batch_size, shuffle=False)
-    dec_test_dataloader = DataLoader(
-        dec_test_data_combined, batch_size=batch_size, shuffle=False)
-
-    attr_names = train_dataset_obj.params
-    data_objects = {"dataset_obj": train_dataset_obj,
-                    "enc_train_dataloader": enc_train_dataloader,
-                    "enc_test_dataloader": enc_test_dataloader,
-                    "dec_train_dataloader": dec_train_dataloader,
-                    "dec_test_dataloader": dec_test_dataloader,
-                    "input_dim": input_dim,
-                    "attr": attr_names,  # optional
-                    "classif_per_tp": False,  # optional
-                    "n_labels": 1}  # optional
-
-    return data_objects
+    # train_dataset_obj = PhysioNet('data/physionet', train=True,
+    #                               quantization=q,
+    #                               download=True, n_samples=min(10000, args.n),
+    #                               device=device)
+    # # Use custom collate_fn to combine samples with arbitrary time observations.
+    # # Returns the dataset along with mask and time steps
+    # test_dataset_obj = PhysioNet('data/physionet', train=False,
+    #                              quantization=q,
+    #                              download=True, n_samples=min(10000, args.n),
+    #                              device=device)
+    #
+    # # Combine and shuffle samples from physionet Train and physionet Test
+    # total_dataset = train_dataset_obj[:len(train_dataset_obj)]
+    #
+    # if not args.classif:
+    #     # Concatenate samples from original Train and Test sets
+    #     # Only 'training' physionet samples are have labels.
+    #     # Therefore, if we do classifiction task, we don't need physionet 'test' samples.
+    #     total_dataset = total_dataset + \
+    #         test_dataset_obj[:len(test_dataset_obj)]
+    # print(len(total_dataset))
+    # # Shuffle and split
+    # train_data, test_data = model_selection.train_test_split(total_dataset, train_size=0.8,
+    #                                                          random_state=42, shuffle=True)
+    #
+    # record_id, tt, vals, mask, labels = train_data[0]
+    #
+    # # n_samples = len(total_dataset)
+    # input_dim = vals.size(-1)
+    # data_min, data_max = get_data_min_max(total_dataset, device)
+    # batch_size = min(min(len(train_dataset_obj), args.batch_size), args.n)
+    #
+    # def extrap(test_data):
+    #     enc_test_data = []
+    #     dec_test_data = []
+    #     for (record_id, tt, vals, mask, labels) in test_data:
+    #         midpt = 0
+    #         for tp in tt:
+    #             if tp < 24:
+    #                 midpt += 1
+    #             else:
+    #                 break
+    #         if mask[:midpt].sum() and mask[midpt:].sum():
+    #             enc_test_data.append(
+    #                 (record_id, tt[:midpt], vals[:midpt], mask[:midpt], labels))
+    #             dec_test_data.append(
+    #                 (record_id, tt[midpt:], vals[midpt:], mask[midpt:], labels))
+    #     return enc_test_data, dec_test_data
+    #
+    # enc_train_data, dec_train_data = extrap(train_data)
+    # enc_test_data, dec_test_data = extrap(test_data)
+    # enc_train_data_combined = variable_time_collate_fn(
+    #     enc_train_data, device, classify=args.classif, data_min=data_min, data_max=data_max)
+    # dec_train_data_combined = variable_time_collate_fn(
+    #     dec_train_data, device, classify=args.classif, data_min=data_min, data_max=data_max)
+    # enc_test_data_combined = variable_time_collate_fn(
+    #     enc_test_data, device, classify=args.classif, data_min=data_min, data_max=data_max)
+    # dec_test_data_combined = variable_time_collate_fn(
+    #     dec_test_data, device, classify=args.classif, data_min=data_min, data_max=data_max)
+    # print(enc_train_data_combined.shape, dec_train_data_combined.shape)
+    # print(enc_test_data_combined.shape, dec_test_data_combined.shape)
+    #
+    # # keep the timepoints in enc between 0.0 and 0.5
+    # enc_train_data_combined[:, :, -1] *= 0.5
+    # enc_test_data_combined[:, :, -1] *= 0.5
+    # print(enc_train_data_combined[0, :, -1], dec_train_data_combined[0, :, -1])
+    # enc_train_dataloader = DataLoader(
+    #     enc_train_data_combined, batch_size=batch_size, shuffle=False)
+    # dec_train_dataloader = DataLoader(
+    #     dec_train_data_combined, batch_size=batch_size, shuffle=False)
+    # enc_test_dataloader = DataLoader(
+    #     enc_test_data_combined, batch_size=batch_size, shuffle=False)
+    # dec_test_dataloader = DataLoader(
+    #     dec_test_data_combined, batch_size=batch_size, shuffle=False)
+    #
+    # attr_names = train_dataset_obj.params
+    # data_objects = {"dataset_obj": train_dataset_obj,
+    #                 "enc_train_dataloader": enc_train_dataloader,
+    #                 "enc_test_dataloader": enc_test_dataloader,
+    #                 "dec_train_dataloader": dec_train_dataloader,
+    #                 "dec_test_dataloader": dec_test_dataloader,
+    #                 "input_dim": input_dim,
+    #                 "attr": attr_names,  # optional
+    #                 "classif_per_tp": False,  # optional
+    #                 "n_labels": 1}  # optional
+    #
+    # return data_objects
+    ...
 
 
 def subsample_timepoints(data, time_steps, mask, percentage_tp_to_sample=None):
@@ -695,3 +928,8 @@ def subsample_timepoints(data, time_steps, mask, percentage_tp_to_sample=None):
             mask[i, tp_to_set_to_zero] = 0.
 
     return data, time_steps, mask
+
+
+def set_device(device_):
+    global device
+    device = device_

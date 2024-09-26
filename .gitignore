@@ -1,2 +1,6 @@
 .DS_Store
 imgs/.DS_Store
+.ipynb_checkpoints/
+.vscode/
+datasets/
+results/
