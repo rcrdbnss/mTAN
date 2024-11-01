@@ -21,7 +21,7 @@ class Regressor(nn.Module):
     def forward(self, z):
         _, out = self.gru_rnn(z)
         out = self.regressor(out.squeeze(0))
-        out = out.squeeze()
+        out = out.squeeze(-1)
         return out
 
 

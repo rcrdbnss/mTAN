@@ -176,9 +176,11 @@ if __name__ == '__main__':
             train_n += batch_len
             mse_x += utils.mean_squared_error(observed_data, pred_x.mean(0), observed_mask) * batch_len
 
-            mse_y += mean_squared_error(label.cpu().detach().numpy(), pred_y.cpu().detach().numpy()) * batch_len
-            mae_y += mean_absolute_error(label.cpu().detach().numpy(), pred_y.cpu().detach().numpy()) * batch_len
-            train_r2 += r2_score(label.cpu().detach().numpy(), pred_y.cpu().detach().numpy()) * batch_len
+            label, pred_y = label.cpu().detach().numpy(), pred_y.cpu().detach().numpy()
+            label, pred_y = label.reshape(-1, 1), pred_y.reshape(-1, 1)
+            mse_y += mean_squared_error(label, pred_y) * batch_len
+            mae_y += mean_absolute_error(label, pred_y) * batch_len
+            train_r2 += r2_score(label, pred_y) * batch_len
 
         total_time += time.time() - start_time
         val_loss, val_acc, val_mse, val_mae, val_r2 = utils.evaluate_regressor(
@@ -187,10 +189,16 @@ if __name__ == '__main__':
             data_max=(data_obj['data_max'] if 'data_max' in data_obj else None))
         val_losses.append(val_loss)
         if val_loss <= best_val_loss:
-            best_val_loss = min(best_val_loss, val_loss)
-            best_regressor = regressor.state_dict()
-            best_rec = rec.state_dict()
-            best_dec = dec.state_dict()
+            best_val_loss = val_loss
+            torch.save({
+                'args': args,
+                'epoch': itr,
+                'rec_state_dict': rec.state_dict(),
+                'dec_state_dict': dec.state_dict(),
+                'regressor_state_dict': regressor.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': -val_loss,
+            }, f'{args.dataset}_{args.enc}_{args.dec}_{experiment_id}.h5')
             best_iter = itr
         test_loss, test_acc, test_mse, test_mae, test_r2 = utils.evaluate_regressor(
             rec, test_loader, args=args, regressor=regressor, reconst=True, num_sample=1, dim=dim,
@@ -204,24 +212,13 @@ if __name__ == '__main__':
             f'val_mse: {val_mse:.4f}, val_mae: {val_mae:.4f}, val_r2: {val_r2:.4f}, test_loss: {test_loss:.4f}, test_acc: {test_acc:.4f}, '
             f'test_mse: {test_mse:.4f}, test_mae: {test_mae:.4f}, test_r2: {test_r2:.4f}')
 
-        # if itr % 100 == 0 and args.save:
-        #     torch.save({
-        #         'args': args,
-        #         'epoch': itr,
-        #         'rec_state_dict': rec_state_dict,
-        #         'dec_state_dict': dec_state_dict,
-        #         'regressor_state_dict': regressor_state_dict,
-        #         'loss': -loss,
-        #     }, args.dataset + '_' +
-        #        args.enc + '_' +
-        #        args.dec + '_' +
-        #        str(experiment_id) +
-        #        '.h5')
     print(f'Best iteration: {best_iter}, {best_val_loss}')
-    regressor.load_state_dict(best_regressor)
-    rec.load_state_dict(best_rec)
-    dec.load_state_dict(best_dec)
-
+    checkpoint = torch.load(f'{args.dataset}_{args.enc}_{args.dec}_{experiment_id}.h5')
+    rec.load_state_dict(checkpoint['rec_state_dict'])
+    dec.load_state_dict(checkpoint['dec_state_dict'])
+    regressor.load_state_dict(checkpoint['regressor_state_dict'])
+    os.remove(f'{args.dataset}_{args.enc}_{args.dec}_{experiment_id}.h5')
+    
     print('Testing...')
     if args.dataset in ['french', 'ushcn']:
         scalers = D['scalers']
