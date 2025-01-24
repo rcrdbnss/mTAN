@@ -36,6 +36,8 @@ def get_X_M_T(X, feat_mask):
         M = np.concatenate(M, axis=1)
         # T = np.concatenate(T, axis=1)
         return X, M, T
+    else:
+        return [], [], []
 
 
 def adapter(X, X_spt, X_exg, feat_mask, E: bool, S: bool):
